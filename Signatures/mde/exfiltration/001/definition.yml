@@ -1,0 +1,113 @@
+_ids:
+  defender:
+    3928808b-8a46-426b-8f87-051a36bb2f91: '7757'
+    77a86f48-0553-46f7-8b1f-5b7c0e1625f2: '67450'
+    f55b1f7d-7a7f-49e4-9b90-55218aad89f8: '9267'
+  delta: X0058
+category: Discovery
+date:
+  created: '2023-10-17'
+  lastReviewed: '2023-10-17'
+description: |-
+  Released to SOC on 2023-10-17.
+
+  This alert indicates that a single process on a device has been observed interacting with an unusually large number of devices using remote MS-SRVS protocol, which has methods for reading and writing information about shares.  This is consistent with many SMB enumeration programs which all interact with this pipe on the machines they target.
+
+  This detection looks for combinations of named pipe events on the source device that indicate the process is interacting with another device using the MS-SRVS protocol, grouping by the device names the process accessed and alerting when the number of devices interacted with becomes excessive.
+enabled: true
+frequency: 1H
+impactedAssets:
+  - identifier: deviceId
+    type: device
+jiraRef: EDRDR-400
+lifecycle: live
+mitreTechniques:
+  - T1135
+name: 'Discovery: 0005: Mass MS-SRVS Named Pipe Access Consistent with SMB Enumeration'
+recommendedActions:
+  - name: discovery_0005_1
+    type: detection
+  - name: discovery_0005_2
+    type: detection
+  - name: discovery_0005_3
+    type: detection
+  - name: discovery_0005_4
+    type: detection
+severity: low
+kql: |-
+  // Discovery: 0005: Mass MS-SRVS Named Pipe Access Consistent with SMB Enumeration
+  // This detection rule looks for processes connecting to multiple unique devices using remote MS-SRVS
+  // Many MS-SRVS enumeration tools do this, which I believe derives from the use of the NetShareEnum function which many of them use
+  // The detection logic can be summarized as:
+  // - Build a list of named pipe events where the pipe name indicates a remote SCM named pipe on another device (\Device\Mup\<RemoteHost>\PIPE\srvsvc)
+  // - Extract the remote device name from the pipe name
+  // - Summarize, counting the number of unique remote devices seen for this specific process on this device
+  // - Keep only those events that exceed the threshold number of unique devices
+  // -----------------------------
+  // TUNING OPTIONS
+  let HorizonDeviceRegex = @"(?i)^pv(stl|wdr)hz(gen|app|egj)\d+(cz|uk)";   // Regex to match CZ Horizon servers for exclusion in a specific tuning case
+  let UniqueRemoteDeviceThreshold=10;                         // Minimum number of unique devices the process must have interacted with via remote SCM to trigger an alert
+  let UniqueRemoteDeviceExplorerThreshold=20;                 // Interactions by explorer.exe are more likely to be legitimate user interaction so we cannot set the threshold as sensitive
+  let ShareManagerLookupPeriod = 4h;                          //Specific to Sharemanager exclusion
+  let ShareManagerLookupBin = ShareManagerLookupPeriod / 2.0; //Specific to Sharemanager exclusion
+  // -----------------------------
+  // MAIN QUERY
+  DeviceEvents
+      | where ActionType=~"NamedPipeEvent" //and Timestamp > ago(4h) // Temporary solution - query still seems to be looking back over 30 days despite running hourly
+          // Remove HitmanPro named pipe events which are almost 3 orders of magnitude more common than any other pipe name - purely for efficiency
+              | where not(AdditionalFields has @"\\Device\\NamedPipe\\hmpalert") // literal double-slashes intentional.
+          // SCCM's SmsExec commonly seen interacting with Remote SCM on other devices
+              | where not(InitiatingProcessFileName=~"smsexec.exe" and DeviceName contains "sccm" and InitiatingProcessCommandLine=~'"smsexec.exe"' and InitiatingProcessParentFileName=~"services.exe" and InitiatingProcessAccountName=~"system")
+      | where AdditionalFields has_all(@"Device\\Mup", "srvsvc") // Pre-filter for efficiency.  Again, double-slashes intentional
+      | extend PipeName=tostring(todynamic(AdditionalFields).PipeName), NamedPipeEnd=tostring(todynamic(AdditionalFields).NamedPipeEnd)
+      | extend RemoteDeviceName = tostring(extract_all(@"device\\mup\\([^\\]+)\\pipe\\srvsvc", tolower(PipeName))[0])
+      | extend IsExplorerInitiated = (InitiatingProcessFileName=~"explorer.exe" and InitiatingProcessFolderPath=~@"C:\Windows\explorer.exe" and InitiatingProcessParentFileName=~"userinit.exe")
+      | where isnotempty(RemoteDeviceName)
+      // Exclusions that depend on extracted fields
+          // Exclude explorer.exe on CZ horizon devices initiating named pipe remote SCM connections to other horizon servers
+              | where not(IsExplorerInitiated and (
+                      (DeviceName matches regex HorizonDeviceRegex and RemoteDeviceName matches regex HorizonDeviceRegex)
+                      or (DeviceName matches regex @"(?i)^pvrtsrtiap\d+uk" and RemoteDeviceName matches regex @"(?i)^pvrtsrtiap\d+uk")
+                      or (DeviceName has "pvamtappst001ce" and InitiatingProcessAccountName has "svc_sl_deployment" and (RemoteDeviceName startswith "10.8" or RemoteDeviceName startswith "10.10" or  RemoteDeviceName startswith "172.27" or RemoteDeviceName matches regex ("10.110.\\d{1,2}.\\d{3}")) // Tuning #828, #1944 - svc_sl_deployment is used (interactively!) in CE to access files on CE storeline machines, IPs of the form 10.8X., 10.10X and 10.110.X.XXX
+                      or (DeviceName has "til" and InitiatingProcessFileName =~ "explorer.exe" and (RemoteDeviceName matches regex @"(?i)^pvsub(w|s)(apps|event|cron)\d\d\d+uk" or RemoteDeviceName matches regex @"(?i)^pvsubevent\d\d+uk")) //Tuning #858 -Excludes TIL servers accessing files on HSC app support servers
+                      or (DeviceName matches regex @"pvamtappst002ce(\.cz\.delta-europe\.com)?$" and InitiatingProcessFileName =~ "explorer.exe" and InitiatingProcessAccountName =~"admin-ukrishn3" and RemoteDeviceName matches regex @"10.(8\d|1\d{2}).\d{2,3}.\d{2,3}") // Tuning #1195
+                      or (DeviceName matches regex @"pvmdmapp(ds|js|jb|mt)0\d{2}uk\.global\.delta\.org" and (InitiatingProcessAccountName matches regex "a-in458002(86|92)" or InitiatingProcessAccountName =~ "a-a418") and (RemoteDeviceName matches regex @"^pv(mdm|iot)app(br|pa|ws|ds|js|jb|ds|mt)0\d[0-8]{1,2}uk(\.global\.delta\.org)?$" or RemoteDeviceName matches regex @"pvwdchzmgt\d{2}uk(\.global\.delta\.org)?$" or RemoteDeviceName matches regex @"vpc\d{5}bg1165\.tgrc\.delta\.org")) // TR #1051, #1227 - BAU activity for Kenna patching
+                      or(DeviceName=~"pvcdlritap002uk.global.delta.org" and InitiatingProcessAccountName=~"a-fm74" and RemoteDeviceName matches regex @"uk\d{5}inf03.ukroi.delta.org") //Tuning #864 - CBO system engineer performing deployment from spider host to CBO servers
+                  )
+              ))
+              | where not(IsExplorerInitiated and DeviceName in~ ("huprgvmritapp01.hu.delta-europe.com","skprgvmrit01n.sk.delta-europe.com") and InitiatingProcessAccountName=~"svc_sl_deployment" and RemoteDeviceName matches regex @"(?i)^sto\d+mfs\d\.(sk|hu)\.delta-europe\.com$") // Tuning #1100
+              | where not(IsExplorerInitiated and DeviceName matches regex @"pvstrmsgrt00\duk.global.delta.org" and RemoteDeviceName matches regex @"pvstrmsgrt00\duk.global.delta.org" and InitiatingProcessAccountName =~ "a-xd89") // Tuning #1423
+              | where not(DeviceName =~ "pvuksdcwmgt001.global.delta.org" and InitiatingProcessFileName =~ "offlineassessmentclient.exe" and InitiatingProcessFolderPath =~ @"c:\program files (x86)\offlineassessmentclient\offlineassessmentclient.exe" and InitiatingProcessAccountName =~ "pw_ad_domadmpwd" and InitiatingProcessVersionInfoCompanyName == "Microsoft Corporation" and InitiatingProcessVersionInfoProductName =~ "Premier Proactive Assessment Services") //Tuning #1613
+              | where not(DeviceName =~ "vpc15627bg0855.global.delta.org" and InitiatingProcessFileName =~ "smsexec.exe" and InitiatingProcessAccountName=~"system" and InitiatingProcessFolderPath has @"microsoft configuration manager\bin\x64\smsexec.exe" and InitiatingProcessVersionInfoProductName == "Microsoft Configuration Manager" and RemoteDeviceName matches regex @"^(vpc\d+bg0855|p[pv]\w+wsccm[x\d]+(in|uk))\.global\.delta\.org$") // SCCM vpc devices communicating with each other and other SCCM servers - tuning #1754
+              | where not(DeviceName =~ "bit4209333mfs1.cz.delta-europe.com" and  InitiatingProcessCommandLine =~ "Explorer.exe" and InitiatingProcessAccountName =~ "a-ine12422813" and RemoteDeviceName matches regex @"sto\d{7}mfs1.(sk|hu).delta-europe.com") //Tuning #1951 Tuned out team that is opening smb and named pipes to multiple storeline systems for troubleshooting
+              | where not(DeviceName=~ "pvcdlritap002uk.global.delta.org" and InitiatingProcessFileName =~ "explorer.exe" and InitiatingProcessParentFileName =~ "userinit.exe" and InitiatingProcessAccountName =~ "a-in45936676" and RemoteDeviceName matches regex @"(.*)uk\d{5}inf03.ukroi.delta.org$") //Tuning #1968 Tuned out systems engineer who accesses inf03 servers
+              | where not(DeviceName =~ "pvssomgmt0003uk.ukroi.delta.org" and InitiatingProcessCommandLine =~ "explorer.exe" and InitiatingProcessAccountName =~ "supprex" and not(ipv4_is_private(RemoteIP))) // Tuning #2155 - Tuned out device known for managing store systems, the tune focuses on picking up on the public IP we use in stores by the Device and Account
+              | where not(DeviceName =~ "czpvrsasgho01n.cz.delta-europe.com" and InitiatingProcessCommandLine =~ "explorer.exe" and InitiatingProcessAccountName =~ "admin-sureshp" and RemoteDeviceName matches regex @"^sto420\d{4}mfs1$") // Tuning #2155 - additional device and host tuned for same behaviour on RemoteDevices in group sto420 seen in the other 2155 tuning
+      | extend RemoteDeviceInfo = strcat(format_datetime(Timestamp,'yyyy-MM-dd HH:mm:ss'), ": ", RemoteDeviceName)
+      | summarize RemoteNamedPipeCount=count(),
+          UniqueRemoteDevices=dcount(RemoteDeviceName),
+          RemoteDeviceInfo=make_set(RemoteDeviceInfo),
+          (Timestamp, ReportId, DeviceId)=arg_max(Timestamp, ReportId, DeviceId)
+          by InitiatingProcessFileName, InitiatingProcessId, InitiatingProcessCreationTime, InitiatingProcessAccountName, InitiatingProcessCommandLine, InitiatingProcessParentFileName, InitiatingProcessParentId, DeviceName, IsExplorerInitiated //, bin(Timestamp, 4h) // Uncomment this part if running over longer than 4h lookback, to accurately simulate detection performance
+      | where (UniqueRemoteDevices > UniqueRemoteDeviceThreshold and not(IsExplorerInitiated)) or (UniqueRemoteDevices > UniqueRemoteDeviceExplorerThreshold and IsExplorerInitiated)
+      | extend RemoteDeviceInfo=array_sort_asc(RemoteDeviceInfo)
+  | extend TimeKey = bin(Timestamp, ShareManagerLookupBin)
+  //Join events based on the TimeKey
+  | join kind=leftouter (
+      DeviceEvents // This exclusion to find Sharemanager2 being ran, within a 2 hour range of explorer.exe
+      | extend TimeKey = range(bin(Timestamp, ShareManagerLookupBin),
+                              bin(Timestamp + ShareManagerLookupPeriod, ShareManagerLookupBin),
+                                  ShareManagerLookupBin)
+      | mv-expand TimeKey to typeof(datetime)
+      | where AdditionalFields has "wkssvc" and InitiatingProcessFileName =~ "net.exe" and InitiatingProcessParentFileName =~ "ShareManager2.exe"
+      | project ShareManagerTimestamp=Timestamp, TimeKey, DeviceId, InitiatingProcessParentFileName
+      ) on DeviceId, TimeKey
+      | extend ShareManagerTimestampDiff = Timestamp - ShareManagerTimestamp
+      | where not(ShareManagerTimestampDiff between (-30s..ShareManagerLookupPeriod) and isnotnull(ShareManagerTimestamp) and IsExplorerInitiated == 1)
+  //Tuning #1234 removing TRC40808.ZIP.lnk used to connect to Store servers from RTS server to process QDX files
+  | join kind=leftouter (
+      DeviceEvents
+      | where FileName =~ "TRC40808.ZIP.lnk" and FolderPath =~ @"C:\Users\admin-sureshp\AppData\Roaming\Microsoft\Windows\Recent" and InitiatingProcessAccountName =~ "admin-sureshp"
+      | project FileName, FolderPath, InitiatingProcessAccountName, DeviceId
+      ) on DeviceId
+      | where not(FileName =~ "TRC40808.ZIP.lnk" and FolderPath =~ @"C:\Users\admin-sureshp\AppData\Roaming\Microsoft\Windows\Recent" and InitiatingProcessAccountName =~ "admin-sureshp")
